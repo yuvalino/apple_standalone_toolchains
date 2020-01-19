@@ -6,6 +6,7 @@ import tarfile
 import argparse
 import plistlib
 import subprocess
+import contextlib
 
 ARCHS = [
     'x86',
@@ -106,17 +107,36 @@ int main(int argc, char * argv[])
 }}
 '''
 
-def compile_c(c_code):
-    wrapper_compiler = subprocess.Popen(
-        ['/usr/bin/env', 'cc', '-o', '/dev/stdout', '-x', 'c', '-'],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+def run(*args, stdin=False, pipe_stdout=False, pipe_stderr=False):
+    process = subprocess.Popen(
+        args,
+        stdin=None if stdin is None else subprocess.PIPE,
+        stdout=subprocess.PIPE if pipe_stdout else None,
+        stderr=subprocess.PIPE if pipe_stderr else None,
     )
-    stdout, stderr = wrapper_compiler.communicate(c_code.encode())
-    if wrapper_compiler.returncode != 0:
-        raise ValueError('failed to compiler wrapper:\n{}'.format(stderr.decode('utf-8')))
+    stdout, stderr = process.communicate(stdin)
+    return process.returncode, stdout, stderr
+
+def compile_c(c_code):
+    returncode, stdout, stderr = run(
+        '/usr/bin/env', 'cc', '-o', '/dev/stdout', '-x', 'c', '-',
+        stdin=c_code.encode(),
+        pipe_stdout=True,
+        pipe_stderr=True,
+    )
+    if returncode != 0:
+        raise ValueError(f'failed to compiler wrapper:\n{stderr.decode("utf-8")}')
     return stdout
+
+def make(folder, *args, jobs=16, verbose=False):
+    returncode, stdout, stderr = run(
+        '/usr/bin/env', 'make', '-C', folder, f'-j{jobs}',
+        *args,
+        pipe_stdout=not verbose,
+        pipe_stderr=True,
+    )
+    if returncode != 0:
+        raise ValueError(f'failed to make:\n{stderr.decode("utf-8")}')
 
 def mkdir(path, mode=0o777, exist_ok=False, recursive=False):
     if os.path.isdir(path) and exist_ok:
@@ -126,6 +146,17 @@ def mkdir(path, mode=0o777, exist_ok=False, recursive=False):
         return
     os.mkdir(path, mode)
     return
+
+@contextlib.contextmanager
+def at(directory, create=False):
+    curr_dir = os.getcwd()
+    if create and not os.path.isdir(directory):
+        mkdir(directory)
+    os.chdir(directory)
+    try:
+        yield
+    finally:
+        os.chdir(curr_dir)
 
 def extract(input_path, output_path):
     if os.path.isdir(input_path):
@@ -168,14 +199,22 @@ def create_apple_toolchain(
     min_version,
     clang,
     clangxx,
+    verbose,
     force,
 ):
+    install_dir = os.path.abspath(install_dir)
+    tools_dir = os.path.abspath(os.path.dirname(__file__))
+    tmp_dir = os.path.join(install_dir, 'tmp')
+
     # Create installation directory, take -f/--force into account
     if os.path.isdir(install_dir):
         if not force:
             raise ValueError(f'installation dir "{install_dir}" already exists (use -f to force)')
         shutil.rmtree(install_dir)
     mkdir(install_dir)
+    
+    if not os.path.isdir(tmp_dir):
+        mkdir(tmp_dir)
 
     print(f'creating apple standalone toolchain for arch {arch}')
 
@@ -192,14 +231,17 @@ def create_apple_toolchain(
         print(f'defaulting to minimum version {sdk_info["platform"]}{min_version}')
 
     mkdir(bin_dir)
+    
+    target_triple = f'{arch}-apple-darwin11'
 
-    target_triple = f'{arch}-darwin-apple'
+    # Compile clang wrapper for target architecture and platform
     wrapper = compile_c(
         CLANG_WRAPPER.format(
             compiler=clang,
             platform_high=sdk_info['platform'].upper(),
             platform_low=sdk_info['platform'].lower(),
             target_triple=target_triple,
+            
             arch=arch,
             default_min_version=min_version,
         )
@@ -208,10 +250,57 @@ def create_apple_toolchain(
     with open(wrapper_path, 'wb') as writer:
         writer.write(wrapper)
         os.chmod(wrapper_path, 0o755)
+
+    # Build dependencies
+    with at(tmp_dir):
+        # Build ldid
+        with at('ldid', create=True):
+            ldid_dir = os.path.join(tools_dir, 'submodules', 'ldid')
+            make(ldid_dir, 'install', f'INSTALLPREFIX={install_dir}', verbose=verbose)
+        
+        # Build apple-libtapi
+        with at('apple-libtapi', create=True):
+            libtapi_dir = os.path.join(tools_dir, 'submodules', 'apple-libtapi')
+            os.environ['INSTALLPREFIX'] = install_dir
+            returncode, stdout, stderr = run(
+                os.path.join(libtapi_dir, 'build.sh'),
+                pipe_stdout=not verbose,
+                pipe_stderr=True,
+            )
+            del os.environ['INSTALLPREFIX']
+            if returncode != 0:
+                raise ValueError(f'failed to make apple-libtapi:\n{stderr.decode("utf-8")}')
+        
+        # Build cctools / ld64
+        with at('cctools', create=True):
+            cctools_dir = os.path.join(tools_dir, 'submodules', 'cctools-port', 'cctools')
+            returncode, stdout, stderr = run(
+                os.path.join(cctools_dir, 'configure'),
+                f'--target={target_triple}',
+                f'--prefix={install_dir}',
+                f'--with-libtapi={install_dir}',
+                pipe_stdout=not verbose,
+                pipe_stderr=True,
+            )
+            if returncode != 0:
+                raise ValueError(f'failed to configure cctools:\n{stderr.decode("utf-8")}')
+            make('.', verbose=verbose)
+            make('.', 'install', verbose=verbose)
+
+        # Check if toolchain works
+        returncode, stdout, stderr = run(
+            os.path.join(bin_dir, f'{target_triple}-{os.path.basename(clang)}'),
+            '-o', '/dev/stdout', '-x', 'c', '-',
+            stdin='int main(){return 0;}'.encode(),
+            pipe_stdout=True,
+            pipe_stderr=True,
+        )
+        if returncode != 0:
+            raise ValueError(f'failed to compile test with toolchain:\n{stderr.decode("utf-8")}')
     
+    print('done')
 
 def main():
-
     arg_parser = argparse.ArgumentParser()
 
     # Required
@@ -222,6 +311,7 @@ def main():
     arg_parser.add_argument('--min-version')
     arg_parser.add_argument('--clang', default='clang')
     arg_parser.add_argument('--clangxx', help='takes --clang and adds ++ by default')
+    arg_parser.add_argument('-v', action='store_true')
     arg_parser.add_argument('-f', '--force', action='store_true')
     
     args = arg_parser.parse_args()
@@ -236,6 +326,7 @@ def main():
         min_version = args.min_version,
         clang       = args.clang,
         clangxx     = args.clangxx,
+        verbose     = args.v,
         force       = args.force,
     )
 
