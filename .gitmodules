@@ -1,0 +1,9 @@
+[submodule "submodules/ldid"]
+	path = submodules/ldid
+	url = git@github.com:tpoechtrager/ldid.git
+[submodule "submodules/apple-libtapi"]
+	path = submodules/apple-libtapi
+	url = git@github.com:tpoechtrager/apple-libtapi.git
+[submodule "submodules/cctools-port"]
+	path = submodules/cctools-port
+	url = git@github.com:tpoechtrager/cctools-port.git
