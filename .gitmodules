@@ -6,7 +6,5 @@
 	url = git@github.com:tpoechtrager/apple-libtapi.git
 [submodule "submodules/cctools-port"]
 	path = submodules/cctools-port
-	url = git@github.com:tpoechtrager/cctools-port.git
-[submodule "submodules/llvm-project"]
-	path = submodules/llvm-project
-	url = https://github.com/llvm/llvm-project.git
+    url = git@github.com:tpoechtrager/cctools-port.git
+
