@@ -17,7 +17,7 @@ ARCHS = [
 
 MIN_VERSION = dict(
     iphoneos = '4.0',
-    macosx   = '10.5',
+    macosx   = '10.6',
 )
 
 CLANG_WRAPPER = '''
@@ -57,6 +57,7 @@ int main(int argc, char * argv[])
     char sdk_path[1024] = {{0}};
     char arch[128] = {{0}};
     char min_os_version[128] = {{0}};
+    char env_path[4096] = {{0}};
 
     char * compiler_path = NULL;
 
@@ -89,7 +90,11 @@ int main(int argc, char * argv[])
 
     strcpy(min_os_version, "-m{platform_low}-version-min=");
     fromenv(min_os_version + strlen(min_os_version), "{platform_high}_DEPLOYMENT_TARGET", "{default_min_version}");
-     
+    
+    snprintf(env_path, 4095, "%s:", compiler_path);
+    fromenv(env_path + strlen(env_path), "PATH", "");
+
+    setenv("PATH", env_path, 1);
     setenv("CODESIGN_ALLOCATE", "{target_triple}-codesign_allocate", 1);
     setenv("IOS_FAKE_CODE_SIGN", "1", 1);
     setenv("COMPILER_PATH", compiler_path, 1);
@@ -211,7 +216,7 @@ def create_apple_toolchain(
         if not force:
             raise ValueError(f'installation dir "{install_dir}" already exists (use -f to force)')
         shutil.rmtree(install_dir)
-    mkdir(install_dir)
+    mkdir(install_dir, recursive=True)
     
     if not os.path.isdir(tmp_dir):
         mkdir(tmp_dir)
@@ -247,6 +252,23 @@ def create_apple_toolchain(
         )
     )
     wrapper_path = os.path.join(bin_dir, f'{target_triple}-{os.path.basename(clang)}')
+    with open(wrapper_path, 'wb') as writer:
+        writer.write(wrapper)
+        os.chmod(wrapper_path, 0o755)
+
+    # Now for C++
+    wrapper = compile_c(
+        CLANG_WRAPPER.format(
+            compiler=clangxx,
+            platform_high=sdk_info['platform'].upper(),
+            platform_low=sdk_info['platform'].lower(),
+            target_triple=target_triple,
+            
+            arch=arch,
+            default_min_version=min_version,
+        )
+    )
+    wrapper_path = os.path.join(bin_dir, f'{target_triple}-{os.path.basename(clangxx)}')
     with open(wrapper_path, 'wb') as writer:
         writer.write(wrapper)
         os.chmod(wrapper_path, 0o755)
